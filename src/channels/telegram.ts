@@ -11,6 +11,7 @@
  * namespace across bots. See .claude/skills/telegram-multi-instance.
  */
 import { createTelegramAdapter } from '@chat-adapter/telegram';
+import type { Adapter, AdapterPostableMessage, PostableRaw } from 'chat';
 
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
@@ -53,6 +54,81 @@ async function withRetry<T>(fn: () => Promise<T>, label: string, maxAttempts = 5
     }
   }
   throw lastErr;
+}
+
+/**
+ * Telegram rejects an otherwise valid send when its Markdown entity parser
+ * encounters malformed URL syntax. This is deterministic: retrying the same
+ * formatted payload cannot succeed. Keep detection narrow so network/rate-limit
+ * failures remain owned by the normal delivery retry loop.
+ */
+export function isTelegramEntityParseError(err: unknown): boolean {
+  const messages: string[] = [];
+  const seen = new Set<unknown>();
+  let current: unknown = err;
+  while (current && !seen.has(current)) {
+    seen.add(current);
+    if (current instanceof Error) {
+      messages.push(current.message);
+      current = current.cause;
+      continue;
+    }
+    if (typeof current === 'object') {
+      const value = current as { message?: unknown; cause?: unknown };
+      if (typeof value.message === 'string') messages.push(value.message);
+      current = value.cause;
+      continue;
+    }
+    if (typeof current === 'string') messages.push(current);
+    break;
+  }
+  const message = messages.join(' ');
+  return /can't parse entities/i.test(message) && /(?:url|entity|entities)/i.test(message);
+}
+
+function asTelegramPlainText(message: AdapterPostableMessage): PostableRaw | null {
+  if (!message || typeof message !== 'object' || !('markdown' in message) || typeof message.markdown !== 'string') {
+    return null;
+  }
+  return {
+    raw: message.markdown,
+    ...(message.files ? { files: message.files } : {}),
+    ...(message.attachments ? { attachments: message.attachments } : {}),
+  };
+}
+
+/**
+ * Add one in-call plain-text fallback for Telegram's deterministic entity
+ * parsing rejection. If the fallback also fails, rethrow so delivery.ts keeps
+ * its existing retry/terminal-failure behavior. Non-parse errors are never
+ * sent twice here.
+ */
+export function installTelegramPlainTextFallback<T extends Adapter>(adapter: T): T {
+  const postMessage = adapter.postMessage.bind(adapter);
+  adapter.postMessage = (async (threadId, message) => {
+    try {
+      return await postMessage(threadId, message);
+    } catch (err) {
+      const plain = isTelegramEntityParseError(err) ? asTelegramPlainText(message) : null;
+      if (!plain) throw err;
+
+      log.warn('Telegram rejected formatted entities; retrying once as plain text', {
+        threadId,
+        err,
+      });
+      try {
+        return await postMessage(threadId, plain);
+      } catch (fallbackErr) {
+        log.error('Telegram plain-text fallback failed; surfacing to delivery retries', {
+          threadId,
+          initialError: err,
+          err: fallbackErr,
+        });
+        throw fallbackErr;
+      }
+    }
+  }) as T['postMessage'];
+  return adapter;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -375,10 +451,12 @@ export function createTelegramBridge(options: TelegramBridgeOptions = {}): Chann
     return null;
   }
   claimedBotIds.set(botId, instanceKey);
-  const telegramAdapter = createTelegramAdapter({
-    botToken: token,
-    mode: 'polling',
-  });
+  const telegramAdapter = installTelegramPlainTextFallback(
+    createTelegramAdapter({
+      botToken: token,
+      mode: 'polling',
+    }),
+  );
   const bridge = createChatSdkBridge({
     adapter: telegramAdapter,
     instance: options.instanceKey, // undefined ⇒ default instance (keyed by channelType)
